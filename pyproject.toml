@@ -1,0 +1,45 @@
+[tool.poetry]
+name = "text-generation-webui"
+version = "0.1.0"
+description = ""
+authors = []
+
+[tool.poetry.dependencies]
+python = "~3.10"
+accelerate = "0.18.0"
+colorama = "^0.4.6"
+datasets = "^2.12.0"
+flexgen = "0.1.7"
+gradio-client = "0.1.4"
+gradio = "3.25.0"
+markdown = "^3.4.3"
+numpy = "1.24.2"
+pandas = "<2.0"
+pillow = ">=9.5.0"
+pyyaml = "^6.0"
+requests = "^2.30.0"
+rwkv = "0.7.3"
+safetensors = "0.3.1"
+sentencepiece = "^0.1.99"
+tqdm = "^4.65.0"
+peft = {git = "https://github.com/huggingface/peft"}
+transformers = "4.28.1"
+bitsandbytes = {version = "0.38.0", platform = "!windows"}
+llama-cpp-python = {version = "0.1.41", platform = "!windows"}
+orjson = "<=3.8.10"
+
+[tool.poetry.dev-dependencies]
+# build systems for dependencies
+hatchling = "^1.3.1"
+
+[tool.poetry.group.nvidia.dependencies]
+torchaudio = "^2.0.1"
+torchvision = "^0.15.1"
+
+
+[tool.poetry.group.mpt.dependencies]
+einops = "^0.6.1"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
