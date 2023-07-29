@@ -13,7 +13,7 @@
   symlinkJoin,
 }: let
   pname = "bitsandbytes";
-  version = "0.40.0";
+  version = "0.40.2";
 
   inherit (torch) cudaCapabilities cudaPackages cudaSupport;
   inherit (cudaPackages) backendStdenv cudaVersion;
@@ -58,7 +58,7 @@ in
 
     postPatch =
       ''
-        substituteInPlace setup.py --replace 'version=f"0.40.0.post4",' "version='0.40.0',"
+        substituteInPlace setup.py --replace 'version=f"0.40.0.post4",' "version='0.40.2',"
         substituteInPlace Makefile --replace "/usr/bin/g++" "g++" --replace "lib64" "lib"
         substituteInPlace bitsandbytes/cuda_setup/main.py  \
           --replace "binary_path = package_dir / binary_name"  \
