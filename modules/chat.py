@@ -26,6 +26,22 @@ from modules.utils import (
 )
 
 
+def str_presenter(dumper, data):
+    """
+    Copied from https://github.com/yaml/pyyaml/issues/240
+    Makes pyyaml output prettier multiline strings.
+    """
+
+    if data.count('\n') > 0:
+        return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='|')
+
+    return dumper.represent_scalar('tag:yaml.org,2002:str', data)
+
+
+yaml.add_representer(str, str_presenter)
+yaml.representer.SafeRepresenter.add_representer(str, str_presenter)
+
+
 def get_turn_substrings(state, instruct=False):
     if instruct:
         if 'turn_template' not in state or state['turn_template'] == '':
@@ -86,10 +102,19 @@ def generate_chat_prompt(user_input, state, **kwargs):
     else:
         wrapper = '<|prompt|>'
 
+    if is_instruct:
+        context = state['context_instruct']
+    else:
+        context = replace_character_names(
+            f"{state['context'].strip()}\n",
+            state['name1'],
+            state['name2']
+        )
+
     # Build the prompt
+    rows = [context]
     min_rows = 3
     i = len(history) - 1
-    rows = [state['context_instruct'] if is_instruct else f"{state['context'].strip()}\n"]
     while i >= 0 and get_encoded_length(wrapper.replace('<|prompt|>', ''.join(rows))) < max_length:
         if _continue and i == len(history) - 1:
             if state['mode'] != 'chat-instruct':
@@ -150,9 +175,6 @@ def get_stopping_strings(state):
             f"\n{state['name2']}:"
         ]
 
-    if state['stop_at_newline']:
-        stopping_strings.append("\n")
-
     return stopping_strings
 
 
@@ -174,11 +196,9 @@ def chatbot_wrapper(text, state, regenerate=False, _continue=False, loading_mess
 
     # Preparing the input
     if not any((regenerate, _continue)):
-        text, visible_text = apply_extensions('input_hijack', text, visible_text)
-        if visible_text is None:
-            visible_text = text
-
-        text = apply_extensions('input', text, state)
+        visible_text = text
+        text, visible_text = apply_extensions('chat_input', text, visible_text, state)
+        text = apply_extensions('input', text, state, is_chat=True)
 
         # *Is typing...*
         if loading_message:
@@ -207,75 +227,55 @@ def chatbot_wrapper(text, state, regenerate=False, _continue=False, loading_mess
         prompt = generate_chat_prompt(text, state, **kwargs)
 
     # Generate
-    cumulative_reply = ''
-    for i in range(state['chat_generation_attempts']):
-        reply = None
-        for j, reply in enumerate(generate_reply(prompt + cumulative_reply, state, stopping_strings=stopping_strings, is_chat=True)):
-            reply = cumulative_reply + reply
+    reply = None
+    for j, reply in enumerate(generate_reply(prompt, state, stopping_strings=stopping_strings, is_chat=True)):
 
-            # Extract the reply
-            visible_reply = re.sub("(<USER>|<user>|{{user}})", state['name1'], reply)
+        # Extract the reply
+        visible_reply = re.sub("(<USER>|<user>|{{user}})", state['name1'], reply)
 
-            # We need this global variable to handle the Stop event,
-            # otherwise gradio gets confused
-            if shared.stop_everything:
-                output['visible'][-1][1] = apply_extensions('output', output['visible'][-1][1], state)
+        # We need this global variable to handle the Stop event,
+        # otherwise gradio gets confused
+        if shared.stop_everything:
+            output['visible'][-1][1] = apply_extensions('output', output['visible'][-1][1], state, is_chat=True)
+            yield output
+            return
+
+        if just_started:
+            just_started = False
+            if not _continue:
+                output['internal'].append(['', ''])
+                output['visible'].append(['', ''])
+
+        if _continue:
+            output['internal'][-1] = [text, last_reply[0] + reply]
+            output['visible'][-1] = [visible_text, last_reply[1] + visible_reply]
+            if is_stream:
                 yield output
-                return
+        elif not (j == 0 and visible_reply.strip() == ''):
+            output['internal'][-1] = [text, reply.lstrip(' ')]
+            output['visible'][-1] = [visible_text, visible_reply.lstrip(' ')]
+            if is_stream:
+                yield output
 
-            if just_started:
-                just_started = False
-                if not _continue:
-                    output['internal'].append(['', ''])
-                    output['visible'].append(['', ''])
-
-            if _continue:
-                output['internal'][-1] = [text, last_reply[0] + reply]
-                output['visible'][-1] = [visible_text, last_reply[1] + visible_reply]
-                if is_stream:
-                    yield output
-            elif not (j == 0 and visible_reply.strip() == ''):
-                output['internal'][-1] = [text, reply.lstrip(' ')]
-                output['visible'][-1] = [visible_text, visible_reply.lstrip(' ')]
-                if is_stream:
-                    yield output
-
-        if reply in [None, cumulative_reply]:
-            break
-        else:
-            cumulative_reply = reply
-
-    output['visible'][-1][1] = apply_extensions('output', output['visible'][-1][1], state)
+    output['visible'][-1][1] = apply_extensions('output', output['visible'][-1][1], state, is_chat=True)
     yield output
 
 
-def impersonate_wrapper(text, start_with, state):
+def impersonate_wrapper(text, state):
     if shared.model_name == 'None' or shared.model is None:
         logger.error("No model is loaded! Select one in the Model tab.")
         yield ''
         return
 
-    # Defining some variables
-    cumulative_reply = ''
     prompt = generate_chat_prompt('', state, impersonate=True)
     stopping_strings = get_stopping_strings(state)
 
     yield text + '...'
-    cumulative_reply = text
-    for i in range(state['chat_generation_attempts']):
-        reply = None
-        for reply in generate_reply(prompt + cumulative_reply, state, stopping_strings=stopping_strings, is_chat=True):
-            reply = cumulative_reply + reply
-            yield reply.lstrip(' ')
-            if shared.stop_everything:
-                return
-
-        if reply in [None, cumulative_reply]:
-            break
-        else:
-            cumulative_reply = reply
-
-    yield cumulative_reply.lstrip(' ')
+    reply = None
+    for reply in generate_reply(prompt + text, state, stopping_strings=stopping_strings, is_chat=True):
+        yield (text + reply).lstrip(' ')
+        if shared.stop_everything:
+            return
 
 
 def generate_chat_reply(text, state, regenerate=False, _continue=False, loading_message=True):
@@ -291,15 +291,15 @@ def generate_chat_reply(text, state, regenerate=False, _continue=False, loading_
 
 
 # Same as above but returns HTML for the UI
-def generate_chat_reply_wrapper(text, start_with, state, regenerate=False, _continue=False):
-    if start_with != '' and not _continue:
+def generate_chat_reply_wrapper(text, state, regenerate=False, _continue=False):
+    if state['start_with'] != '' and not _continue:
         if regenerate:
             text, state['history'] = remove_last_message(state['history'])
             regenerate = False
 
         _continue = True
         send_dummy_message(text, state)
-        send_dummy_reply(start_with, state)
+        send_dummy_reply(state['start_with'], state)
 
     for i, history in enumerate(generate_chat_reply(text, state, regenerate, _continue, loading_message=True)):
         yield chat_html_wrapper(history, state['name1'], state['name2'], state['mode'], state['chat_style']), history
@@ -324,9 +324,12 @@ def send_last_reply_to_input(history):
 
 def replace_last_reply(text, state):
     history = state['history']
-    if len(history['visible']) > 0:
+
+    if len(text.strip()) == 0:
+        return history
+    elif len(history['visible']) > 0:
         history['visible'][-1][1] = text
-        history['internal'][-1][1] = apply_extensions('input', text, state)
+        history['internal'][-1][1] = apply_extensions('input', text, state, is_chat=True)
 
     return history
 
@@ -334,7 +337,7 @@ def replace_last_reply(text, state):
 def send_dummy_message(text, state):
     history = state['history']
     history['visible'].append([text, ''])
-    history['internal'].append([apply_extensions('input', text, state), ''])
+    history['internal'].append([apply_extensions('input', text, state, is_chat=True), ''])
     return history
 
 
@@ -345,12 +348,12 @@ def send_dummy_reply(text, state):
         history['internal'].append(['', ''])
 
     history['visible'][-1][1] = text
-    history['internal'][-1][1] = apply_extensions('input', text, state)
+    history['internal'][-1][1] = apply_extensions('input', text, state, is_chat=True)
     return history
 
 
 def clear_chat_log(state):
-    greeting = state['greeting']
+    greeting = replace_character_names(state['greeting'], state['name1'], state['name2'])
     mode = state['mode']
     history = state['history']
 
@@ -359,7 +362,7 @@ def clear_chat_log(state):
     if mode != 'instruct':
         if greeting != '':
             history['internal'] += [['<|BEGIN-VISIBLE-CHAT|>', greeting]]
-            history['visible'] += [['', apply_extensions('output', greeting, state)]]
+            history['visible'] += [['', apply_extensions('output', greeting, state, is_chat=True)]]
 
     return history
 
@@ -370,6 +373,9 @@ def redraw_html(history, name1, name2, mode, style, reset_cache=False):
 
 def save_history(history, path=None):
     p = path or Path('logs/exported_history.json')
+    if not p.parent.is_dir():
+        p.parent.mkdir(parents=True)
+
     with open(p, 'w', encoding='utf-8') as f:
         f.write(json.dumps(history, indent=4))
 
@@ -389,18 +395,29 @@ def load_history(file, history):
 
 
 def save_persistent_history(history, character, mode):
-    if mode in ['chat', 'chat-instruct'] and character not in  ['', 'None', None] and not shared.args.multi_user:
-        save_history(history, path=Path(f'logs/{character}_persistent.json'))
+    if mode in ['chat', 'chat-instruct'] and character not in ['', 'None', None] and not shared.args.multi_user:
+        save_history(history, path=Path(f'logs/persistent_{character}.json'))
 
 
 def load_persistent_history(state):
+    if shared.session_is_loading:
+        shared.session_is_loading = False
+        return state['history']
+
     if state['mode'] == 'instruct':
         return state['history']
 
     character = state['character_menu']
-    greeting = state['greeting']
-    p = Path(f'logs/{character}_persistent.json')
-    if not shared.args.multi_user and character not in ['None', '', None] and p.exists():
+    greeting = replace_character_names(state['greeting'], state['name1'], state['name2'])
+
+    should_load_history = (not shared.args.multi_user and character not in ['None', '', None])
+    old_p = Path(f'logs/{character}_persistent.json')
+    p = Path(f'logs/persistent_{character}.json')
+    if should_load_history and old_p.exists():
+        logger.warning(f"Renaming {old_p} to {p}")
+        old_p.rename(p)
+
+    if should_load_history and p.exists():
         f = json.loads(open(p, 'rb').read())
         if 'internal' in f and 'visible' in f:
             history = f
@@ -412,7 +429,7 @@ def load_persistent_history(state):
         history = {'internal': [], 'visible': []}
         if greeting != "":
             history['internal'] += [['<|BEGIN-VISIBLE-CHAT|>', greeting]]
-            history['visible'] += [['', apply_extensions('output', greeting, state)]]
+            history['visible'] += [['', apply_extensions('output', greeting, state, is_chat=True)]]
 
     return history
 
@@ -420,18 +437,6 @@ def load_persistent_history(state):
 def replace_character_names(text, name1, name2):
     text = text.replace('{{user}}', name1).replace('{{char}}', name2)
     return text.replace('<USER>', name1).replace('<BOT>', name2)
-
-
-def build_pygmalion_style_context(data):
-    context = ""
-    if 'char_persona' in data and data['char_persona'] != '':
-        context += f"{data['char_name']}'s Persona: {data['char_persona']}\n"
-
-    if 'world_scenario' in data and data['world_scenario'] != '':
-        context += f"Scenario: {data['world_scenario']}\n"
-
-    context = f"{context.strip()}\n<START>\n"
-    return context
 
 
 def generate_pfp_cache(character):
@@ -454,11 +459,11 @@ def load_character(character, name1, name2, instruct=False):
     picture = None
 
     # Deleting the profile picture cache, if any
-    if Path("cache/pfp_character.png").exists():
+    if Path("cache/pfp_character.png").exists() and not instruct:
         Path("cache/pfp_character.png").unlink()
 
     if character not in ['None', '', None]:
-        folder = 'characters' if not instruct else 'characters/instruction-following'
+        folder = 'characters' if not instruct else 'instruction-templates'
         picture = generate_pfp_cache(character)
         filepath = None
         for extension in ["yml", "yaml", "json"]:
@@ -485,10 +490,6 @@ def load_character(character, name1, name2, instruct=False):
                 name1 = data[k]
                 break
 
-        for field in ['context', 'greeting', 'example_dialogue', 'char_persona', 'char_greeting', 'world_scenario']:
-            if field in data:
-                data[field] = replace_character_names(data[field], name1, name2)
-
         if 'context' in data:
             context = data['context']
             if not instruct:
@@ -496,9 +497,6 @@ def load_character(character, name1, name2, instruct=False):
         elif "char_persona" in data:
             context = build_pygmalion_style_context(data)
             greeting_field = 'char_greeting'
-
-        if 'example_dialogue' in data:
-            context += f"{data['example_dialogue'].strip()}\n"
 
         if greeting_field in data:
             greeting = data[greeting_field]
@@ -510,7 +508,6 @@ def load_character(character, name1, name2, instruct=False):
         context = shared.settings['context']
         name2 = shared.settings['name2']
         greeting = shared.settings['greeting']
-        turn_template = shared.settings['turn_template']
 
     return name1, name2, picture, greeting, context, turn_template.replace("\n", r"\n")
 
@@ -520,40 +517,67 @@ def load_character_memoized(character, name1, name2, instruct=False):
     return load_character(character, name1, name2, instruct=instruct)
 
 
-def upload_character(json_file, img, tavern=False):
-    json_file = json_file if type(json_file) == str else json_file.decode('utf-8')
-    data = json.loads(json_file)
-    outfile_name = data["char_name"]
+def upload_character(file, img, tavern=False):
+    decoded_file = file if type(file) == str else file.decode('utf-8')
+    try:
+        data = json.loads(decoded_file)
+    except:
+        data = yaml.safe_load(decoded_file)
+
+    if 'char_name' in data:
+        name = data['char_name']
+        greeting = data['char_greeting']
+        context = build_pygmalion_style_context(data)
+        yaml_data = generate_character_yaml(name, greeting, context)
+    else:
+        name = data['name']
+        yaml_data = generate_character_yaml(data['name'], data['greeting'], data['context'])
+
+    outfile_name = name
     i = 1
-    while Path(f'characters/{outfile_name}.json').exists():
-        outfile_name = f'{data["char_name"]}_{i:03d}'
+    while Path(f'characters/{outfile_name}.yaml').exists():
+        outfile_name = f'{name}_{i:03d}'
         i += 1
 
-    if tavern:
-        outfile_name = f'TavernAI-{outfile_name}'
-
-    with open(Path(f'characters/{outfile_name}.json'), 'w', encoding='utf-8') as f:
-        f.write(json_file)
+    with open(Path(f'characters/{outfile_name}.yaml'), 'w', encoding='utf-8') as f:
+        f.write(yaml_data)
 
     if img is not None:
         img.save(Path(f'characters/{outfile_name}.png'))
 
-    logger.info(f'New character saved to "characters/{outfile_name}.json".')
+    logger.info(f'New character saved to "characters/{outfile_name}.yaml".')
     return gr.update(value=outfile_name, choices=get_available_characters())
 
 
+def build_pygmalion_style_context(data):
+    context = ""
+    if 'char_persona' in data and data['char_persona'] != '':
+        context += f"{data['char_name']}'s Persona: {data['char_persona']}\n"
+
+    if 'world_scenario' in data and data['world_scenario'] != '':
+        context += f"Scenario: {data['world_scenario']}\n"
+
+    if 'example_dialogue' in data and data['example_dialogue'] != '':
+        context += f"{data['example_dialogue'].strip()}\n"
+
+    context = f"{context.strip()}\n"
+    return context
+
+
 def upload_tavern_character(img, _json):
-    _json = {"char_name": _json['name'], "char_persona": _json['description'], "char_greeting": _json["first_mes"], "example_dialogue": _json['mes_example'], "world_scenario": _json['scenario']}
+    _json = {'char_name': _json['name'], 'char_persona': _json['description'], 'char_greeting': _json['first_mes'], 'example_dialogue': _json['mes_example'], 'world_scenario': _json['scenario']}
     return upload_character(json.dumps(_json), img, tavern=True)
 
 
 def check_tavern_character(img):
     if "chara" not in img.info:
         return "Not a TavernAI card", None, None, gr.update(interactive=False)
-    decoded_string = base64.b64decode(img.info['chara'])
+
+    decoded_string = base64.b64decode(img.info['chara']).replace(b'\\r\\n', b'\\n')
     _json = json.loads(decoded_string)
     if "data" in _json:
         _json = _json["data"]
+
     return _json['name'], _json['description'], _json, gr.update(interactive=True)
 
 
@@ -579,7 +603,7 @@ def generate_character_yaml(name, greeting, context):
     }
 
     data = {k: v for k, v in data.items() if v}  # Strip falsy
-    return yaml.dump(data, sort_keys=False)
+    return yaml.dump(data, sort_keys=False, width=float("inf"))
 
 
 def generate_instruction_template_yaml(user, bot, context, turn_template):
@@ -591,7 +615,7 @@ def generate_instruction_template_yaml(user, bot, context, turn_template):
     }
 
     data = {k: v for k, v in data.items() if v}  # Strip falsy
-    return yaml.dump(data, sort_keys=False)
+    return yaml.dump(data, sort_keys=False, width=float("inf"))
 
 
 def save_character(name, greeting, context, picture, filename):

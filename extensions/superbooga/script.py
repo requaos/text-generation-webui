@@ -4,7 +4,7 @@ import textwrap
 import gradio as gr
 from bs4 import BeautifulSoup
 
-from modules import chat, shared
+from modules import chat
 from modules.logging_colors import logger
 
 from .chromadb import add_chunks_to_collector, make_collector
@@ -69,7 +69,7 @@ def feed_url_into_collector(urls, chunk_len, chunk_sep, strong_cleanup, threads)
     cumulative += 'Processing the HTML sources...'
     yield cumulative
     for content in contents:
-        soup = BeautifulSoup(content, features="html.parser")
+        soup = BeautifulSoup(content, features="lxml")
         for script in soup(["script", "style"]):
             script.extract()
 
@@ -96,7 +96,8 @@ def apply_settings(chunk_count, chunk_count_initial, time_weight):
 def custom_generate_chat_prompt(user_input, state, **kwargs):
     global chat_collector
 
-    history = state['history']
+    # get history as being modified when using regenerate.
+    history = kwargs['history']
 
     if state['mode'] == 'instruct':
         results = collector.get_sorted(user_input, n_results=params['chunk_count'])
@@ -113,7 +114,7 @@ def custom_generate_chat_prompt(user_input, state, **kwargs):
         if len(history['internal']) > params['chunk_count'] and user_input != '':
             chunks = []
             hist_size = len(history['internal'])
-            for i in range(hist_size-1):
+            for i in range(hist_size - 1):
                 chunks.append(make_single_exchange(i))
 
             add_chunks_to_collector(chunks, chat_collector)
@@ -142,8 +143,8 @@ def remove_special_tokens(string):
     return re.sub(pattern, '', string)
 
 
-def input_modifier(string):
-    if shared.is_chat():
+def input_modifier(string, state, is_chat=False):
+    if is_chat:
         return string
 
     # Find the user input

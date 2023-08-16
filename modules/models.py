@@ -1,9 +1,9 @@
 import gc
+import hashlib
 import os
 import re
 import time
 from pathlib import Path
-import hashlib
 
 import torch
 import transformers
@@ -14,7 +14,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
-    BitsAndBytesConfig,
+    BitsAndBytesConfig
 )
 
 import modules.shared as shared
@@ -55,10 +55,11 @@ def load_model(model_name, loader=None):
         'AutoGPTQ': AutoGPTQ_loader,
         'GPTQ-for-LLaMa': GPTQ_loader,
         'llama.cpp': llamacpp_loader,
-        'FlexGen': flexgen_loader,
+        'llamacpp_HF': llamacpp_HF_loader,
         'RWKV': RWKV_loader,
         'ExLlama': ExLlama_loader,
-        'ExLlama_HF': ExLlama_HF_loader
+        'ExLlama_HF': ExLlama_HF_loader,
+        'ctransformers': ctransformers_loader,
     }
 
     p = Path(model_name)
@@ -106,11 +107,11 @@ def load_tokenizer(model_name, model):
                 use_fast=False
             )
         except ValueError:
-             tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer = AutoTokenizer.from_pretrained(
                 path_to_model,
                 trust_remote_code=shared.args.trust_remote_code,
                 use_fast=True
-            )           
+            )
 
     if tokenizer.__class__.__name__ == 'LlamaTokenizer':
         pairs = [
@@ -144,9 +145,9 @@ def huggingface_loader(model_name):
             LoaderClass = AutoModelForCausalLM
 
     # Load the model in simple 16-bit mode by default
-    if not any([shared.args.cpu, shared.args.load_in_8bit, shared.args.load_in_4bit, shared.args.auto_devices, shared.args.disk, shared.args.deepspeed, shared.args.gpu_memory is not None, shared.args.cpu_memory is not None]):
+    if not any([shared.args.cpu, shared.args.load_in_8bit, shared.args.load_in_4bit, shared.args.auto_devices, shared.args.disk, shared.args.deepspeed, shared.args.gpu_memory is not None, shared.args.cpu_memory is not None, shared.args.compress_pos_emb > 1, shared.args.alpha_value > 1]):
         model = LoaderClass.from_pretrained(Path(f"{shared.args.model_dir}/{model_name}"), low_cpu_mem_usage=True, torch_dtype=torch.bfloat16 if shared.args.bf16 else torch.float16, trust_remote_code=shared.args.trust_remote_code)
-        if torch.has_mps:
+        if torch.backends.mps.is_available():
             device = torch.device('mps')
             model = model.to(device)
         else:
@@ -166,7 +167,7 @@ def huggingface_loader(model_name):
             "trust_remote_code": shared.args.trust_remote_code
         }
 
-        if not any((shared.args.cpu, torch.cuda.is_available(), torch.has_mps)):
+        if not any((shared.args.cpu, torch.cuda.is_available(), torch.backends.mps.is_available())):
             logger.warning("torch.cuda.is_available() returned False. This means that no GPU has been detected. Falling back to CPU mode.")
             shared.args.cpu = True
 
@@ -215,34 +216,13 @@ def huggingface_loader(model_name):
                 no_split_module_classes=model._no_split_modules
             )
 
+        if shared.args.compress_pos_emb > 1:
+            params['rope_scaling'] = {'type': 'linear', 'factor': shared.args.compress_pos_emb}
+        elif shared.args.alpha_value > 1:
+            params['rope_scaling'] = {'type': 'dynamic', 'factor': shared.args.alpha_value}
+
         model = LoaderClass.from_pretrained(checkpoint, **params)
 
-    return model
-
-
-def flexgen_loader(model_name):
-    from flexgen.flex_opt import CompressionConfig, ExecutionEnv, OptLM, Policy
-
-    # Initialize environment
-    env = ExecutionEnv.create(shared.args.disk_cache_dir)
-
-    # Offloading policy
-    policy = Policy(1, 1,
-                    shared.args.percent[0], shared.args.percent[1],
-                    shared.args.percent[2], shared.args.percent[3],
-                    shared.args.percent[4], shared.args.percent[5],
-                    overlap=True, sep_layer=True, pin_weight=shared.args.pin_weight,
-                    cpu_cache_compute=False, attn_sparsity=1.0,
-                    compress_weight=shared.args.compress_weight,
-                    comp_weight_config=CompressionConfig(
-                        num_bits=4, group_size=64,
-                        group_dim=0, symmetric=False),
-                    compress_cache=False,
-                    comp_cache_config=CompressionConfig(
-                        num_bits=4, group_size=64,
-                        group_dim=2, symmetric=False))
-
-    model = OptLM(f"facebook/{model_name}", env, shared.args.model_dir, policy)
     return model
 
 
@@ -263,8 +243,47 @@ def llamacpp_loader(model_name):
     else:
         model_file = list(Path(f'{shared.args.model_dir}/{model_name}').glob('*ggml*.bin'))[0]
 
-    logger.info(f"llama.cpp weights detected: {model_file}\n")
+    logger.info(f"llama.cpp weights detected: {model_file}")
     model, tokenizer = LlamaCppModel.from_pretrained(model_file)
+    return model, tokenizer
+
+
+def llamacpp_HF_loader(model_name):
+    from modules.llamacpp_hf import LlamacppHF
+
+    for fname in ["oobabooga_llama-tokenizer", "llama-tokenizer"]:
+        path = Path(f'{shared.args.model_dir}/{fname}')
+        if path.exists():
+            break
+    else:
+        logger.error("Could not load the model because a tokenizer in transformers format was not found. Please download oobabooga/llama-tokenizer.")
+        return None, None
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        path,
+        trust_remote_code=shared.args.trust_remote_code,
+        use_fast=False
+    )
+
+    model = LlamacppHF.from_pretrained(model_name)
+    return model, tokenizer
+
+
+def ctransformers_loader(model_name):
+    from modules.ctransformers_model import CtransformersModel
+
+    path = Path(f'{shared.args.model_dir}/{model_name}')
+    ctrans = CtransformersModel()
+    if ctrans.model_type_is_auto():
+        model_file = path
+    else:
+        if path.is_file():
+            model_file = path
+        else:
+            model_file = list(Path(f'{shared.args.model_dir}/{model_name}').glob('*.bin'))[0]
+
+    logger.info(f'ctransformers weights detected: {model_file}')
+    model, tokenizer = ctrans.from_pretrained(model_file)
     return model, tokenizer
 
 
@@ -339,6 +358,7 @@ def clear_torch_cache():
 def unload_model():
     shared.model = shared.tokenizer = None
     shared.lora_names = []
+    shared.model_dirty_from_training = False
     clear_torch_cache()
 
 

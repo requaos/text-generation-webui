@@ -104,7 +104,7 @@ class MirostatLogitsWarper(LogitsWarper):
                 break
 
         # Normalize the probabilities of the remaining words
-        prob_topk = torch.softmax(sorted_logits, dim=0)
+        prob_topk = torch.softmax(sorted_logits, dim=0).to('cuda')
 
         prev_i = torch.multinomial(prob_topk, num_samples=1, replacement=True).to('cuda')
 
@@ -126,6 +126,7 @@ class RepetitionPenaltyLogitsProcessorWithRange(LogitsProcessor):
     '''
     Copied from the transformers library
     '''
+
     def __init__(self, penalty: float, _range: int):
         if not isinstance(penalty, float) or not (penalty > 0):
             raise ValueError(f"`penalty` has to be a strictly positive float, but is {penalty}")
